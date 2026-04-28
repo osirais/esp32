@@ -34,10 +34,11 @@ namespace
   constexpr float kPitchEnterDeg = 24.0f;
   constexpr float kPitchExitDeg = 12.0f;
 
-  constexpr float kTwistAngleThresholdDeg = 28.0f;
-  constexpr float kTwistRateThresholdDps = 100.0f;
-  constexpr uint32_t kTwistCooldownMs = 700;
-  constexpr uint32_t kTwistHoldMs = 450;
+  constexpr float kTwistAngleThresholdDeg = 24.0f;
+  constexpr float kTwistRateThresholdDps = 85.0f;
+  constexpr uint32_t kTwistCooldownMs = 900;
+  constexpr uint32_t kTwistHoldMs = 350;
+  constexpr float kTwistMaxRollPitchDeg = 35.0f;
   constexpr float kNeutralResetRollPitchDeg = 8.0f;
   constexpr uint32_t kNeutralResetHoldMs = 350;
 
@@ -395,19 +396,23 @@ namespace
     persistentAction = classifyPersistentAction();
     updateYawGestureAnchor(nowMs);
 
-    if ((nowMs - lastTwistMs) >= kTwistCooldownMs)
+    const bool inTwistPose =
+        fabsf(orientation.rollDeg) < kTwistMaxRollPitchDeg &&
+        fabsf(orientation.pitchDeg) < kTwistMaxRollPitchDeg;
+
+    if (inTwistPose && (nowMs - lastTwistMs) >= kTwistCooldownMs)
     {
       const float yawOffsetDeg = angleDeltaDeg(yawGestureAnchorDeg, orientation.yawDeg);
 
       if (yawOffsetDeg >= kTwistAngleThresholdDeg &&
           orientation.gyroZDps >= kTwistRateThresholdDps)
       {
-        triggerTwist(HandAction::TwistPositive, nowMs);
+        triggerTwist(HandAction::TwistNegative, nowMs);
       }
       else if (yawOffsetDeg <= -kTwistAngleThresholdDeg &&
                orientation.gyroZDps <= -kTwistRateThresholdDps)
       {
-        triggerTwist(HandAction::TwistNegative, nowMs);
+        triggerTwist(HandAction::TwistPositive, nowMs);
       }
     }
 

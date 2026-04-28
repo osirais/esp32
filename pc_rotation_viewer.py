@@ -37,10 +37,11 @@ ROLL_ENTER_DEG = 28.0
 ROLL_EXIT_DEG = 16.0
 PITCH_ENTER_DEG = 24.0
 PITCH_EXIT_DEG = 12.0
-TWIST_ANGLE_THRESHOLD_DEG = 28.0
-TWIST_RATE_THRESHOLD_DPS = 100.0
-TWIST_COOLDOWN_MS = 700
-TWIST_HOLD_MS = 450
+TWIST_ANGLE_THRESHOLD_DEG = 24.0
+TWIST_RATE_THRESHOLD_DPS = 85.0
+TWIST_COOLDOWN_MS = 900
+TWIST_HOLD_MS = 350
+TWIST_MAX_ROLL_PITCH_DEG = 35.0
 NEUTRAL_RESET_ROLL_PITCH_DEG = 8.0
 NEUTRAL_RESET_HOLD_MS = 350
 HISTORY_LIMIT = 6
@@ -145,24 +146,24 @@ ACTION_STYLES = {
         "computer_detail": "The computer maps the pitch angle into downward cursor motion.",
     },
     "TWIST_POSITIVE": {
-        "title": "Select",
+        "title": "Right Click",
         "accent": "#9f86ff",
         "canvas": "#151125",
         "panel": "#34295e",
         "gesture": "Right twist detected",
-        "hint": "The primary action is firing.",
-        "computer_action": "Primary click",
-        "computer_detail": "The computer treats the twist burst as a click or confirm event.",
+        "hint": "The secondary click action is firing.",
+        "computer_action": "Right click",
+        "computer_detail": "The computer treats the twist burst as a secondary click.",
     },
     "TWIST_NEGATIVE": {
-        "title": "Back",
+        "title": "Left Click",
         "accent": "#55e6df",
         "canvas": "#08181b",
         "panel": "#184247",
         "gesture": "Left twist detected",
-        "hint": "The back action is firing.",
-        "computer_action": "Back or cancel",
-        "computer_detail": "The computer treats the twist burst as a back or cancel event.",
+        "hint": "The primary click action is firing.",
+        "computer_action": "Left click",
+        "computer_detail": "The computer treats the twist burst as a primary click.",
     },
 }
 
@@ -238,8 +239,8 @@ DEFAULT_BINDINGS = {
     "ROLL_NEGATIVE": "Move mouse left",
     "PITCH_UP": "Move mouse up",
     "PITCH_DOWN": "Move mouse down",
-    "TWIST_POSITIVE": "Left click",
-    "TWIST_NEGATIVE": "Back",
+    "TWIST_POSITIVE": "Right click",
+    "TWIST_NEGATIVE": "Left click",
 }
 
 
@@ -1235,15 +1236,20 @@ class RotationWindow:
         self.persistent_action = self._classify_persistent_action()
         self._update_yaw_anchor(now_ms)
 
-        if (now_ms - self.last_twist_ms) >= TWIST_COOLDOWN_MS:
+        in_twist_pose = (
+            abs(self.roll_deg) < TWIST_MAX_ROLL_PITCH_DEG and
+            abs(self.pitch_deg) < TWIST_MAX_ROLL_PITCH_DEG
+        )
+
+        if in_twist_pose and (now_ms - self.last_twist_ms) >= TWIST_COOLDOWN_MS:
             yaw_offset_deg = angle_delta_deg(self.yaw_gesture_anchor_deg, self.yaw_deg)
             if yaw_offset_deg >= TWIST_ANGLE_THRESHOLD_DEG and self.yaw_rate_dps >= TWIST_RATE_THRESHOLD_DPS:
-                self.transient_action = "TWIST_POSITIVE"
+                self.transient_action = "TWIST_NEGATIVE"
                 self.transient_action_until_ms = now_ms + TWIST_HOLD_MS
                 self.last_twist_ms = now_ms
                 self.yaw_gesture_anchor_deg = self.yaw_deg
             elif yaw_offset_deg <= -TWIST_ANGLE_THRESHOLD_DEG and self.yaw_rate_dps <= -TWIST_RATE_THRESHOLD_DPS:
-                self.transient_action = "TWIST_NEGATIVE"
+                self.transient_action = "TWIST_POSITIVE"
                 self.transient_action_until_ms = now_ms + TWIST_HOLD_MS
                 self.last_twist_ms = now_ms
                 self.yaw_gesture_anchor_deg = self.yaw_deg
