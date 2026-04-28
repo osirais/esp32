@@ -4,6 +4,8 @@ import math
 import os
 import queue
 import re
+import shutil
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -13,6 +15,16 @@ try:
     import serial
 except Exception:
     serial = None
+
+try:
+    import gi
+
+    gi.require_version("Atspi", "2.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Atspi, Gdk
+except Exception:
+    Atspi = None
+    Gdk = None
 
 
 PATTERN_LABEL = re.compile(
@@ -59,76 +71,98 @@ COMPUTER_ACTION_OPTIONS = [
     "Play / Pause",
 ]
 
+CONTINUOUS_ACTIONS = {
+    "Move mouse right",
+    "Move mouse left",
+    "Move mouse up",
+    "Move mouse down",
+}
+
+DISCRETE_ACTIONS = {
+    "Left click",
+    "Right click",
+    "Double click",
+    "Back",
+    "Press Space",
+    "Press Enter",
+    "Play / Pause",
+}
+
+REPEATING_ACTIONS = {
+    "Scroll up",
+    "Scroll down",
+}
+
 ACTION_STYLES = {
     "NEUTRAL": {
         "title": "Pause",
         "accent": "#7ad4ff",
         "canvas": "#081722",
         "panel": "#143144",
-        "gesture": "Relax your hand",
-        "hint": "Use this resting pose when you want the pointer to stay still.",
+        "gesture": "Neutral pose",
+        "hint": "No directional gesture is active.",
         "computer_action": "Pointer stays still",
-        "computer_detail": "A calm resting pose so you can pause without taking the device off your hand.",
+        "computer_detail": "The computer holds position while the device is steady.",
     },
     "ROLL_POSITIVE": {
         "title": "Move Right",
         "accent": "#ffae57",
         "canvas": "#1b1209",
         "panel": "#4a2f16",
-        "gesture": "Tilt your hand right",
-        "hint": "A right tilt pushes the pointer across the screen to the right.",
+        "gesture": "Right tilt detected",
+        "hint": "The pointer is moving right.",
         "computer_action": "Pointer moves right",
-        "computer_detail": "Use small tilts for gentle nudges and stronger tilts for quicker travel.",
+        "computer_detail": "Pointer speed follows the strength of the detected tilt.",
     },
     "ROLL_NEGATIVE": {
         "title": "Move Left",
         "accent": "#66efb4",
         "canvas": "#091710",
         "panel": "#174232",
-        "gesture": "Tilt your hand left",
-        "hint": "A left tilt brings the pointer back across the screen.",
+        "gesture": "Left tilt detected",
+        "hint": "The pointer is moving left.",
         "computer_action": "Pointer moves left",
-        "computer_detail": "This is the mirror of moving right, so it feels like steering the cursor.",
+        "computer_detail": "Pointer speed follows the strength of the detected tilt.",
     },
     "PITCH_UP": {
         "title": "Move Up",
         "accent": "#ffe15c",
         "canvas": "#1a1507",
         "panel": "#494015",
-        "gesture": "Lift the front of your hand",
-        "hint": "Raising your hand sends the pointer toward the top of the screen.",
+        "gesture": "Up tilt detected",
+        "hint": "The pointer is moving up.",
         "computer_action": "Pointer moves up",
-        "computer_detail": "It works like pushing the cursor upward without needing a mouse.",
+        "computer_detail": "The computer maps the pitch angle into upward cursor motion.",
     },
     "PITCH_DOWN": {
         "title": "Move Down",
         "accent": "#ff7ea5",
         "canvas": "#1c0d13",
         "panel": "#4c1f2f",
-        "gesture": "Lower the front of your hand",
-        "hint": "Lowering your hand brings the pointer down the screen.",
+        "gesture": "Down tilt detected",
+        "hint": "The pointer is moving down.",
         "computer_action": "Pointer moves down",
-        "computer_detail": "This makes it easy to move through menus or down a page.",
+        "computer_detail": "The computer maps the pitch angle into downward cursor motion.",
     },
     "TWIST_POSITIVE": {
         "title": "Select",
         "accent": "#9f86ff",
         "canvas": "#151125",
         "panel": "#34295e",
-        "gesture": "Quick turn to the right",
-        "hint": "A quick right turn acts like a click or confirm.",
+        "gesture": "Right twist detected",
+        "hint": "The primary action is firing.",
         "computer_action": "Primary click",
-        "computer_detail": "Use it to open something, press a button, or confirm a choice.",
+        "computer_detail": "The computer treats the twist burst as a click or confirm event.",
     },
     "TWIST_NEGATIVE": {
         "title": "Back",
         "accent": "#55e6df",
         "canvas": "#08181b",
         "panel": "#184247",
-        "gesture": "Quick turn to the left",
-        "hint": "A quick left turn works like back, cancel, or a secondary action.",
+        "gesture": "Left twist detected",
+        "hint": "The back action is firing.",
         "computer_action": "Back or cancel",
-        "computer_detail": "This can back out of a screen or undo the last selection.",
+        "computer_detail": "The computer treats the twist burst as a back or cancel event.",
     },
 }
 
@@ -198,13 +232,6 @@ DEMO_SCENES = [
     ),
 ]
 
-DESKTOP_TILES = [
-    {"name": "Browser", "rect": (0.34, 0.28, 0.57, 0.48), "accent": "#4d9dff"},
-    {"name": "Messages", "rect": (0.62, 0.28, 0.86, 0.48), "accent": "#7cde92"},
-    {"name": "Files", "rect": (0.34, 0.56, 0.57, 0.78), "accent": "#ffb357"},
-    {"name": "Music", "rect": (0.62, 0.56, 0.86, 0.78), "accent": "#d08fff"},
-]
-
 DEFAULT_BINDINGS = {
     "NEUTRAL": "Do nothing",
     "ROLL_POSITIVE": "Move mouse right",
@@ -223,6 +250,159 @@ class MotionPacket:
     yaw: float
     scene: str = ""
     timestamp: float = 0.0
+
+
+class DesktopInput:
+    def __init__(self) -> None:
+        self.ydotool_path = shutil.which("ydotool")
+        self.using_ydotool = self.ydotool_path is not None
+        self.available = self.using_ydotool or (Atspi is not None and Gdk is not None)
+        self.last_error = ""
+        if self.using_ydotool:
+            self.status = "Ready"
+            self.backend_name = "ydotool virtual input"
+        elif self.available:
+            self.status = "Ready"
+            self.backend_name = "GNOME accessibility input"
+        else:
+            self.status = "Unavailable"
+            self.backend_name = "No desktop input backend"
+
+    def _run_ydotool(self, *args: str) -> bool:
+        if not self.ydotool_path:
+            return False
+        env = os.environ.copy()
+        if os.path.exists("/tmp/.ydotool_socket"):
+            env["YDOTOOL_SOCKET"] = "/tmp/.ydotool_socket"
+        try:
+            subprocess.Popen(
+                [self.ydotool_path, *args],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.last_error = f"ydotool failed: {exc}"
+            return False
+        return True
+
+    def move_relative(self, dx: int, dy: int) -> bool:
+        if not self.available or (dx == 0 and dy == 0):
+            return False
+        if self.using_ydotool:
+            return self._run_ydotool("mousemove", "--", str(dx), str(dy))
+        try:
+            moved = bool(Atspi.generate_mouse_event(dx, dy, "rel"))
+        except Exception as exc:
+            self.last_error = f"Move failed: {exc}"
+            return False
+        if not moved:
+            self.last_error = "Move event was rejected"
+        return moved
+
+    def click(self, button: int = 1) -> bool:
+        if not self.available:
+            return False
+        if self.using_ydotool:
+            button_map = {
+                1: "0xC0",
+                2: "0xC2",
+                3: "0xC1",
+                4: "0xC4",
+                5: "0xC5",
+            }
+            return self._run_ydotool("click", button_map.get(button, "0xC0"))
+        try:
+            clicked = bool(Atspi.generate_mouse_event(0, 0, f"b{button}c"))
+        except Exception as exc:
+            self.last_error = f"Click failed: {exc}"
+            return False
+        if not clicked:
+            self.last_error = "Click event was rejected"
+        return clicked
+
+    def double_click(self) -> bool:
+        first = self.click(1)
+        time.sleep(0.05)
+        second = self.click(1)
+        return first and second
+
+    def scroll(self, direction: str) -> bool:
+        if direction == "up":
+            return self.click(4)
+        if direction == "down":
+            return self.click(5)
+        return False
+
+    def key_press(self, key_name: str) -> bool:
+        if not self.available:
+            return False
+        if self.using_ydotool:
+            key_codes = {
+                "space": "57",
+                "Return": "28",
+                "XF86AudioPlay": "164",
+            }
+            key_code = key_codes.get(key_name)
+            if key_code is None:
+                self.last_error = f"Unknown ydotool key: {key_name}"
+                return False
+            return self._run_ydotool("key", f"{key_code}:1", f"{key_code}:0")
+        keyval = Gdk.keyval_from_name(key_name)
+        if keyval == 0:
+            self.last_error = f"Unknown key: {key_name}"
+            return False
+        try:
+            pressed = bool(Atspi.generate_keyboard_event(keyval, None, Atspi.KeySynthType.PRESSRELEASE))
+        except Exception as exc:
+            self.last_error = f"Key failed: {exc}"
+            return False
+        if not pressed:
+            self.last_error = "Key event was rejected"
+        return pressed
+
+    def back(self) -> bool:
+        if not self.available:
+            return False
+        if self.using_ydotool:
+            return self._run_ydotool("key", "56:1", "105:1", "105:0", "56:0")
+        alt = Gdk.keyval_from_name("Alt_L")
+        left = Gdk.keyval_from_name("Left")
+        if alt == 0 or left == 0:
+            self.last_error = "Back keys unavailable"
+            return False
+        try:
+            pressed = Atspi.generate_keyboard_event(alt, None, Atspi.KeySynthType.PRESS)
+            tapped = Atspi.generate_keyboard_event(left, None, Atspi.KeySynthType.PRESSRELEASE)
+            released = Atspi.generate_keyboard_event(alt, None, Atspi.KeySynthType.RELEASE)
+        except Exception as exc:
+            self.last_error = f"Back failed: {exc}"
+            return False
+        if not (pressed and tapped and released):
+            self.last_error = "Back event was rejected"
+        return bool(pressed and tapped and released)
+
+    def perform(self, action: str) -> bool:
+        if action == "Left click":
+            return self.click(1)
+        if action == "Right click":
+            return self.click(3)
+        if action == "Double click":
+            return self.double_click()
+        if action == "Back":
+            return self.back()
+        if action == "Scroll up":
+            return self.scroll("up")
+        if action == "Scroll down":
+            return self.scroll("down")
+        if action == "Press Space":
+            return self.key_press("space")
+        if action == "Press Enter":
+            return self.key_press("Return")
+        if action == "Play / Pause":
+            return self.key_press("XF86AudioPlay")
+        return False
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -286,11 +466,18 @@ class RotationWindow:
         self.action_queue: queue.Queue[str] = queue.Queue(maxsize=80)
         self.status_queue: queue.Queue[tuple[bool, str]] = queue.Queue(maxsize=20)
         self.stop_event = threading.Event()
+        self.desktop_input = DesktopInput()
 
         self.start_monotonic = time.monotonic()
         self.last_sample_time = 0.0
         self.external_action_expire_at = 0.0
         self.external_action_name = "NEUTRAL"
+        self.input_enabled = False
+        self.last_discrete_action_at = 0.0
+        self.last_repeating_action_at = 0.0
+        self.last_continuous_action_at = 0.0
+        self.last_input_detail = "Disabled"
+        self.input_test_until = 0.0
 
         self.roll_deg = 0.0
         self.pitch_deg = 0.0
@@ -315,6 +502,11 @@ class RotationWindow:
         self.confidence = 40.0
         self.sample_rate_hz = 0.0
         self.led_on = False
+        self.action_changed_at = time.monotonic()
+        self.virtual_cursor_x = 0.5
+        self.virtual_cursor_y = 0.5
+        self.click_flash_until = 0.0
+        self.clicked_tile = ""
 
         self.demo_paused = False
         self.demo_roll_bias = 0.0
@@ -335,13 +527,26 @@ class RotationWindow:
         self.roll_var = tk.StringVar(value="+0.0°")
         self.pitch_var = tk.StringVar(value="+0.0°")
         self.yaw_var = tk.StringVar(value="+0.0°")
+        self.scene_var = tk.StringVar(value=self.scene_name)
+        self.connection_var = tk.StringVar(value=self.connection_detail)
+        self.sample_rate_var = tk.StringVar(value="0 Hz")
+        self.uptime_var = tk.StringVar(value="00:00")
+        self.energy_var = tk.StringVar(value="0%")
+        self.stability_var = tk.StringVar(value="100%")
+        self.confidence_var = tk.StringVar(value="40%")
+        self.led_var = tk.StringVar(value="Off")
+        self.input_state_var = tk.StringVar(value="Disabled")
+        self.input_detail_var = tk.StringVar(value=self.desktop_input.backend_name)
+        self.enable_button_var = tk.StringVar(value="Enable")
         self.binding_vars = {
             action: tk.StringVar(value=DEFAULT_BINDINGS[action])
             for action in ACTION_ORDER
         }
 
         self.axis_widgets: dict[str, dict[str, object]] = {}
+        self.metric_widgets: dict[str, dict[str, object]] = {}
         self.mapping_rows: dict[str, dict[str, tk.Widget]] = {}
+        self.scroll_columns: list[tuple[tk.Widget, tk.Canvas]] = []
 
         for action in ACTION_ORDER:
             self.binding_vars[action].trace_add(
@@ -352,6 +557,7 @@ class RotationWindow:
         self._build_ui()
         self._bind_keys()
         self._apply_action_style()
+        self._update_input_controls()
 
         self.worker = threading.Thread(target=self._data_source_loop, daemon=True)
         self.worker.start()
@@ -363,42 +569,68 @@ class RotationWindow:
 
     def _build_ui(self) -> None:
         shell = tk.Frame(self.root, bg="#07121b")
-        shell.pack(fill="both", expand=True, padx=18, pady=18)
+        shell.pack(fill="both", expand=True, padx=18, pady=14)
 
         header = tk.Frame(
             shell,
             bg="#0d1c29",
-            padx=26,
-            pady=22,
+            padx=14,
+            pady=10,
             highlightthickness=1,
             highlightbackground="#1b3346",
         )
-        header.pack(fill="x", pady=(0, 14))
+        header.pack(fill="x", pady=(0, 10))
 
-        header_left = tk.Frame(header, bg="#0d1c29")
-        header_left.pack(side="left", fill="x", expand=True)
+        header_right = tk.Frame(header, bg="#0d1c29")
+        header_right.pack(side="left")
+
+        self.enable_button = tk.Button(
+            header_right,
+            textvariable=self.enable_button_var,
+            command=self._toggle_input_enabled,
+            bg="#66efb4",
+            fg="#07121b",
+            activebackground="#7dffc5",
+            activeforeground="#07121b",
+            bd=0,
+            padx=28,
+            pady=12,
+            font=("Avenir Next", 14, "bold"),
+        )
+        self.enable_button.pack(side="left")
+
+        test_button = tk.Button(
+            header_right,
+            text="Test Move",
+            command=self._test_desktop_input,
+            bg="#173041",
+            fg="#f4f8ff",
+            activebackground="#214158",
+            activeforeground="#ffffff",
+            bd=0,
+            padx=20,
+            pady=9,
+            font=("Avenir Next", 11, "bold"),
+        )
+        test_button.pack(side="left", padx=(10, 0))
 
         tk.Label(
-            header_left,
-            text="Motion Control Studio",
-            fg="#f4f8ff",
+            header_right,
+            textvariable=self.input_state_var,
+            fg="#c8d7e8",
             bg="#0d1c29",
-            font=("Avenir Next", 28, "bold"),
-        ).pack(anchor="w")
+            font=("Trebuchet MS", 11, "bold"),
+        ).pack(side="left", padx=(14, 0))
 
         body = tk.Frame(shell, bg="#07121b")
         body.pack(fill="both", expand=True)
 
-        left_col = tk.Frame(body, bg="#07121b", width=285)
-        left_col.pack(side="left", fill="y")
-        left_col.pack_propagate(False)
+        left_col = self._scroll_column(body, 285)
 
         center_col = tk.Frame(body, bg="#07121b")
         center_col.pack(side="left", fill="both", expand=True, padx=14)
 
-        right_col = tk.Frame(body, bg="#07121b", width=350)
-        right_col.pack(side="left", fill="y")
-        right_col.pack_propagate(False)
+        right_col = self._scroll_column(body, 350)
 
         self.action_card, action_body = self._card(left_col, None, "#102433")
         self.action_card.pack(fill="x", pady=(0, 12))
@@ -426,6 +658,21 @@ class RotationWindow:
         self._axis_card(axis_body, "Left / Right", "roll", self.roll_var, 90.0)
         self._axis_card(axis_body, "Turn", "yaw", self.yaw_var, 180.0)
 
+        metrics_card, metrics_body = self._card(left_col, "Signal", "#0d1c29")
+        metrics_card.pack(fill="x", pady=(12, 0))
+        self._metric_bar(metrics_body, "Motion", "energy", self.energy_var, "#ffae57")
+        self._metric_bar(metrics_body, "Stability", "stability", self.stability_var, "#66efb4")
+        self._metric_bar(metrics_body, "Confidence", "confidence", self.confidence_var, "#7ad4ff")
+
+        status_card, status_body = self._card(left_col, "Status", "#0d1c29")
+        status_card.pack(fill="x", pady=(12, 0))
+        self._status_line(status_body, "Source", self.connection_var)
+        self._status_line(status_body, "Scene", self.scene_var)
+        self._status_line(status_body, "Rate", self.sample_rate_var)
+        self._status_line(status_body, "Uptime", self.uptime_var)
+        self._status_line(status_body, "LED", self.led_var)
+        self._status_line(status_body, "Input", self.input_detail_var)
+
         self.visual_card, visual_body = self._card(center_col, None, "#0d1c29")
         self.visual_card.pack(fill="both", expand=True)
 
@@ -438,9 +685,46 @@ class RotationWindow:
         self.canvas.pack(fill="both", expand=True)
 
         mappings_card, mappings_body = self._card(right_col, "Mappings", "#0d1c29")
-        mappings_card.pack(fill="both", expand=True)
+        mappings_card.pack(fill="x")
         for action in ACTION_ORDER:
             self._mapping_row(mappings_body, action)
+
+        desktop_card, desktop_body = self._card(right_col, "Preview", "#0d1c29")
+        desktop_card.pack(fill="both", expand=True, pady=(12, 0))
+        self.desktop_canvas = tk.Canvas(desktop_body, bg="#08131c", height=245, highlightthickness=0, bd=0)
+        self.desktop_canvas.pack(fill="both", expand=True)
+
+    def _scroll_column(self, parent: tk.Widget, width: int) -> tk.Frame:
+        outer = tk.Frame(parent, bg="#07121b", width=width)
+        outer.pack(side="left", fill="y")
+        outer.pack_propagate(False)
+
+        canvas = tk.Canvas(
+            outer,
+            bg="#07121b",
+            width=width,
+            highlightthickness=0,
+            bd=0,
+        )
+        scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg="#07121b")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw", width=width - 16)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def update_scroll_region(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def update_inner_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(1, event.width - 16))
+
+        inner.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", update_inner_width)
+        self.scroll_columns.append((outer, canvas))
+
+        return inner
 
     def _card(self, parent: tk.Widget, title: str | None, bg: str) -> tuple[tk.Frame, tk.Frame]:
         frame = tk.Frame(
@@ -598,6 +882,7 @@ class RotationWindow:
         }
 
     def _bind_keys(self) -> None:
+        self.root.bind("<Escape>", lambda _event: self._set_input_enabled(False))
         self.root.bind("<Left>", lambda _event: self._nudge_demo(roll=-10.0))
         self.root.bind("<Right>", lambda _event: self._nudge_demo(roll=10.0))
         self.root.bind("<Up>", lambda _event: self._nudge_demo(pitch=10.0))
@@ -606,6 +891,32 @@ class RotationWindow:
         self.root.bind("d", lambda _event: self._nudge_demo(yaw=16.0))
         self.root.bind("r", lambda _event: self._reset_demo_bias())
         self.root.bind("<space>", lambda _event: self._toggle_demo_pause())
+        self.root.bind_all("<MouseWheel>", self._handle_mousewheel)
+        self.root.bind_all("<Button-4>", self._handle_mousewheel)
+        self.root.bind_all("<Button-5>", self._handle_mousewheel)
+
+    def _handle_mousewheel(self, event: tk.Event) -> str | None:
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        for outer, canvas in self.scroll_columns:
+            if self._is_descendant(widget, outer):
+                if event.num == 4:
+                    canvas.yview_scroll(-3, "units")
+                elif event.num == 5:
+                    canvas.yview_scroll(3, "units")
+                elif event.delta:
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return "break"
+        return None
+
+    def _is_descendant(self, widget: tk.Widget | None, parent: tk.Widget) -> bool:
+        while widget is not None:
+            if widget == parent:
+                return True
+            try:
+                widget = widget.master
+            except AttributeError:
+                return False
+        return False
 
     def _nudge_demo(self, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0) -> None:
         if not self.demo_mode:
@@ -627,6 +938,45 @@ class RotationWindow:
             return
 
         self.demo_paused = not self.demo_paused
+
+    def _toggle_input_enabled(self) -> None:
+        self._set_input_enabled(not self.input_enabled)
+
+    def _set_input_enabled(self, enabled: bool) -> None:
+        if enabled and not self.desktop_input.available:
+            self.input_enabled = False
+            self.last_input_detail = self.desktop_input.backend_name
+            self._update_input_controls()
+            return
+
+        self.input_enabled = enabled
+        self.last_discrete_action_at = time.monotonic()
+        self.last_repeating_action_at = time.monotonic()
+        self.last_input_detail = "Enabled" if enabled else "Disabled"
+        self._update_input_controls()
+
+    def _test_desktop_input(self) -> None:
+        if not self.desktop_input.available:
+            self.last_input_detail = self.desktop_input.backend_name
+            return
+
+        ok = self.desktop_input.move_relative(160, 0)
+        self.root.after(180, lambda: self.desktop_input.move_relative(-160, 0))
+        self.input_test_until = time.monotonic() + 0.8
+        if ok:
+            self.last_input_detail = "Test move sent"
+        else:
+            self.last_input_detail = self.desktop_input.last_error or "Test move failed"
+
+    def _update_input_controls(self) -> None:
+        if self.input_enabled:
+            self.enable_button_var.set("Disable")
+            self.input_state_var.set("Input enabled")
+            self.enable_button.configure(bg="#ff7ea5", activebackground="#ff9ab8", fg="#07121b")
+        else:
+            self.enable_button_var.set("Enable")
+            self.input_state_var.set("Input disabled")
+            self.enable_button.configure(bg="#66efb4", activebackground="#7dffc5", fg="#07121b")
 
     def _data_source_loop(self) -> None:
         if self.demo_mode:
@@ -738,12 +1088,8 @@ class RotationWindow:
                             except queue.Full:
                                 pass
 
-                        parsed_action = self._parse_action(line)
-                        if parsed_action is not None:
-                            try:
-                                self.action_queue.put_nowait(parsed_action)
-                            except queue.Full:
-                                pass
+                        # The desktop app classifies actions from the raw angles so
+                        # local orientation remaps work even if older firmware is running.
             except Exception:
                 try:
                     self.status_queue.put_nowait((False, f"Waiting for {self.serial_port}"))
@@ -787,7 +1133,10 @@ class RotationWindow:
         self._drain_action_queue()
         self._drain_data_queue()
         self._sync_current_mapping()
+        self._update_status_vars()
         self._update_axis_bars()
+        self._update_metric_bars()
+        self._draw_desktop_preview()
         self._draw_scene()
         if not self.stop_event.is_set():
             self.root.after(33, self._tick)
@@ -876,7 +1225,10 @@ class RotationWindow:
         if time.monotonic() < self.external_action_expire_at:
             computed_action = self.external_action_name
 
-        self._set_action(computed_action)
+        action_changed = self._set_action(computed_action)
+        if self.input_enabled:
+            self._update_virtual_cursor(dt)
+        self._perform_configured_input(dt, action_changed)
         self.led_on = self._led_state_for_action(self.action_name, int(now * 1000.0))
 
     def _classify_action(self, now_ms: int) -> str:
@@ -904,23 +1256,23 @@ class RotationWindow:
         return self.persistent_action
 
     def _classify_persistent_action(self) -> str:
-        if self.persistent_action == "ROLL_POSITIVE" and self.roll_deg > ROLL_EXIT_DEG:
+        if self.persistent_action == "ROLL_POSITIVE" and self.pitch_deg < -PITCH_EXIT_DEG:
             return "ROLL_POSITIVE"
-        if self.persistent_action == "ROLL_NEGATIVE" and self.roll_deg < -ROLL_EXIT_DEG:
+        if self.persistent_action == "ROLL_NEGATIVE" and self.pitch_deg > PITCH_EXIT_DEG:
             return "ROLL_NEGATIVE"
-        if self.persistent_action == "PITCH_UP" and self.pitch_deg > PITCH_EXIT_DEG:
+        if self.persistent_action == "PITCH_UP" and self.roll_deg < -ROLL_EXIT_DEG:
             return "PITCH_UP"
-        if self.persistent_action == "PITCH_DOWN" and self.pitch_deg < -PITCH_EXIT_DEG:
+        if self.persistent_action == "PITCH_DOWN" and self.roll_deg > ROLL_EXIT_DEG:
             return "PITCH_DOWN"
 
         if self.roll_deg > ROLL_ENTER_DEG and abs(self.roll_deg) >= abs(self.pitch_deg):
-            return "ROLL_POSITIVE"
-        if self.roll_deg < -ROLL_ENTER_DEG and abs(self.roll_deg) >= abs(self.pitch_deg):
-            return "ROLL_NEGATIVE"
-        if self.pitch_deg > PITCH_ENTER_DEG:
-            return "PITCH_UP"
-        if self.pitch_deg < -PITCH_ENTER_DEG:
             return "PITCH_DOWN"
+        if self.roll_deg < -ROLL_ENTER_DEG and abs(self.roll_deg) >= abs(self.pitch_deg):
+            return "PITCH_UP"
+        if self.pitch_deg > PITCH_ENTER_DEG:
+            return "ROLL_NEGATIVE"
+        if self.pitch_deg < -PITCH_ENTER_DEG:
+            return "ROLL_POSITIVE"
         return "NEUTRAL"
 
     def _update_yaw_anchor(self, now_ms: int) -> None:
@@ -940,21 +1292,86 @@ class RotationWindow:
         if (now_ms - self.neutral_pose_since_ms) >= NEUTRAL_RESET_HOLD_MS:
             self.yaw_gesture_anchor_deg = self.yaw_deg
 
-    def _set_action(self, action: str) -> None:
+    def _set_action(self, action: str) -> bool:
         if action not in ACTION_STYLES:
             action = "NEUTRAL"
 
         if action == self.action_name:
-            return
+            return False
 
         self.action_name = action
+        self.action_changed_at = time.monotonic()
+        if action.startswith("TWIST"):
+            self.click_flash_until = time.monotonic() + 0.32
+            self.clicked_tile = self._tile_under_cursor()
         style = ACTION_STYLES[action]
         self.action_var.set(style["title"])
         self._sync_current_mapping()
         self._apply_action_style()
+        return True
 
     def _sync_current_mapping(self) -> None:
         self.mapped_action_var.set(self.binding_vars[self.action_name].get())
+
+    def _perform_configured_input(self, dt: float, action_changed: bool) -> None:
+        if not self.input_enabled or not self.desktop_input.available:
+            return
+
+        configured_action = self.binding_vars[self.action_name].get()
+        now = time.monotonic()
+
+        if configured_action in CONTINUOUS_ACTIONS:
+            self._perform_continuous_input(configured_action, dt)
+            return
+
+        if configured_action in REPEATING_ACTIONS:
+            if now - self.last_repeating_action_at < 0.10:
+                return
+            if self.desktop_input.perform(configured_action):
+                self.last_repeating_action_at = now
+                self.last_input_detail = configured_action
+            else:
+                self.last_input_detail = self.desktop_input.last_error or f"{configured_action} failed"
+            return
+
+        if configured_action in DISCRETE_ACTIONS and action_changed:
+            if now - self.last_discrete_action_at < 0.28:
+                return
+            if self.desktop_input.perform(configured_action):
+                self.last_discrete_action_at = now
+                self.last_input_detail = configured_action
+            else:
+                self.last_input_detail = self.desktop_input.last_error or f"{configured_action} failed"
+
+    def _perform_continuous_input(self, configured_action: str, dt: float) -> None:
+        if dt <= 0.0:
+            return
+        now = time.monotonic()
+        if now - self.last_continuous_action_at < 0.045:
+            return
+
+        roll_strength = max(0.0, abs(self.roll_deg) - ROLL_EXIT_DEG)
+        pitch_strength = max(0.0, abs(self.pitch_deg) - PITCH_EXIT_DEG)
+        strength = max(roll_strength, pitch_strength)
+        pixels_per_second = 120.0 + min(780.0, strength * 18.0)
+        distance = max(1, int(pixels_per_second * dt))
+
+        dx = 0
+        dy = 0
+        if configured_action == "Move mouse right":
+            dx = distance
+        elif configured_action == "Move mouse left":
+            dx = -distance
+        elif configured_action == "Move mouse up":
+            dy = -distance
+        elif configured_action == "Move mouse down":
+            dy = distance
+
+        if self.desktop_input.move_relative(dx, dy):
+            self.last_continuous_action_at = now
+            self.last_input_detail = configured_action
+        else:
+            self.last_input_detail = self.desktop_input.last_error or "Move failed"
 
     def _on_binding_changed(self, action: str) -> None:
         if action == self.action_name:
@@ -1001,6 +1418,96 @@ class RotationWindow:
             else:
                 canvas.create_rectangle(mid + fill_extent, 4, mid, height - 4, fill=color, outline="")
 
+    def _update_status_vars(self) -> None:
+        self.connection_var.set(self.connection_detail)
+        self.scene_var.set(self.scene_name)
+        self.sample_rate_var.set(f"{self.sample_rate_hz:04.1f} Hz")
+        self.uptime_var.set(format_uptime(time.monotonic() - self.start_monotonic))
+        self.energy_var.set(f"{int(self.motion_energy):3d}%")
+        self.stability_var.set(f"{int(self.stability):3d}%")
+        self.confidence_var.set(f"{int(self.confidence):3d}%")
+        self.led_var.set("On" if self.led_on else "Off")
+        if self.input_enabled:
+            self.input_detail_var.set(self.last_input_detail)
+        elif not self.desktop_input.available:
+            self.input_detail_var.set(self.desktop_input.backend_name)
+        else:
+            self.input_detail_var.set("Disabled")
+
+    def _update_metric_bars(self) -> None:
+        values = {
+            "energy": self.motion_energy,
+            "stability": self.stability,
+            "confidence": self.confidence,
+        }
+        for key, config in self.metric_widgets.items():
+            canvas = config["canvas"]
+            color = str(config["color"])
+            value = clamp(values[key], 0.0, 100.0)
+            width = max(canvas.winfo_width(), 50)
+            height = max(canvas.winfo_height(), 18)
+            canvas.delete("all")
+            canvas.create_rectangle(2, 5, width - 2, height - 5, fill="#08131c", outline="")
+            fill_width = 4.0 + ((width - 8.0) * value / 100.0)
+            canvas.create_rectangle(4, 5, fill_width, height - 5, fill=color, outline="")
+            canvas.create_line(4, height - 4, width - 4, height - 4, fill="#173041")
+
+    def _update_virtual_cursor(self, dt: float) -> None:
+        if dt <= 0.0:
+            return
+
+        speed = 0.10 + min(0.34, abs(self.roll_deg + self.pitch_deg) / 180.0)
+        if self.action_name == "ROLL_POSITIVE":
+            self.virtual_cursor_x += speed * dt
+        elif self.action_name == "ROLL_NEGATIVE":
+            self.virtual_cursor_x -= speed * dt
+        elif self.action_name == "PITCH_UP":
+            self.virtual_cursor_y -= speed * dt
+        elif self.action_name == "PITCH_DOWN":
+            self.virtual_cursor_y += speed * dt
+
+        self.virtual_cursor_x = clamp(self.virtual_cursor_x, 0.08, 0.92)
+        self.virtual_cursor_y = clamp(self.virtual_cursor_y, 0.10, 0.90)
+
+    def _tile_under_cursor(self) -> str:
+        return ""
+
+    def _sync_preview_cursor_to_pointer(self) -> None:
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = max(1, self.root.winfo_width())
+        root_height = max(1, self.root.winfo_height())
+
+        pointer_x = self.root.winfo_pointerx()
+        pointer_y = self.root.winfo_pointery()
+        self.virtual_cursor_x = clamp((pointer_x - root_x) / root_width, 0.08, 0.92)
+        self.virtual_cursor_y = clamp((pointer_y - root_y) / root_height, 0.10, 0.90)
+
+    def _draw_desktop_preview(self) -> None:
+        canvas = self.desktop_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 260)
+        height = max(canvas.winfo_height(), 220)
+        style = self._current_style()
+        accent = style["accent"]
+        if self.input_enabled:
+            self._sync_preview_cursor_to_pointer()
+
+        canvas.create_rectangle(0, 0, width, height, fill="#08131c", outline="")
+        canvas.create_rectangle(14, 16, width - 14, height - 18, fill="#0d1c29", outline="#1f3b50")
+        canvas.create_rectangle(14, 16, width - 14, 42, fill="#102433", outline="")
+        canvas.create_oval(25, 25, 35, 35, fill="#ff7ea5", outline="")
+        canvas.create_oval(43, 25, 53, 35, fill="#ffe15c", outline="")
+        canvas.create_oval(61, 25, 71, 35, fill="#66efb4", outline="")
+        canvas.create_rectangle(30, 58, width - 30, height - 34, fill="#0a1722", outline="#1c3548")
+
+        cx = 14 + ((width - 28) * self.virtual_cursor_x)
+        cy = 16 + ((height - 34) * self.virtual_cursor_y)
+        if time.monotonic() < self.click_flash_until:
+            radius = 24.0 * clamp((self.click_flash_until - time.monotonic()) / 0.32, 0.0, 1.0)
+            canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, outline=accent, width=3)
+        canvas.create_polygon(cx, cy, cx, cy + 25, cx + 8, cy + 18, cx + 14, cy + 32, cx + 20, cy + 29, cx + 14, cy + 16, cx + 25, cy + 16, fill="#ffffff", outline="#07121b")
+
     def _draw_scene(self) -> None:
         self.canvas.delete("all")
         width = max(self.canvas.winfo_width(), 400)
@@ -1028,6 +1535,7 @@ class RotationWindow:
         self._draw_horizon(width, height, accent, base_line)
         self._draw_cube(width, height, accent, canvas_bg)
         self._draw_compass(width, height, accent, base_line)
+        self._draw_action_overlay(width, height, accent, canvas_bg)
         self._draw_timeline(width, height, accent)
 
     def _draw_horizon(self, width: int, height: int, accent: str, base_line: str) -> None:
@@ -1093,6 +1601,61 @@ class RotationWindow:
         inner_y = cy + (math.sin(yaw_angle) * (radius - 28.0))
         self.canvas.create_line(inner_x, inner_y, tip_x, tip_y, fill=accent, width=4)
         self.canvas.create_oval(tip_x - 8, tip_y - 8, tip_x + 8, tip_y + 8, fill=accent, outline="")
+
+    def _draw_action_overlay(self, width: int, height: int, accent: str, canvas_bg: str) -> None:
+        style = self._current_style()
+        age = time.monotonic() - self.action_changed_at
+        pulse = clamp(1.0 - (age / 0.45), 0.0, 1.0)
+        cx = width * 0.5
+        cy = height * 0.64
+        box_w = min(420.0, width * 0.58)
+        box_h = 86.0
+
+        fill = mix_hex(canvas_bg, style["panel"], 0.58)
+        outline = mix_hex(accent, "#ffffff", 0.22 + (0.35 * pulse))
+        self.canvas.create_rectangle(
+            cx - (box_w / 2.0),
+            cy - (box_h / 2.0),
+            cx + (box_w / 2.0),
+            cy + (box_h / 2.0),
+            fill=fill,
+            outline=outline,
+            width=2 + int(3 * pulse),
+        )
+        self.canvas.create_text(
+            cx,
+            cy - 17,
+            text=style["gesture"],
+            fill="#ffffff",
+            font=("Avenir Next", 22, "bold"),
+        )
+        self.canvas.create_text(
+            cx,
+            cy + 19,
+            text=self.binding_vars[self.action_name].get(),
+            fill=mix_hex("#c8d7e8", accent, 0.55),
+            font=("Trebuchet MS", 13, "bold"),
+        )
+
+        if self.led_on:
+            self.canvas.create_oval(
+                cx + (box_w / 2.0) - 42,
+                cy - 12,
+                cx + (box_w / 2.0) - 18,
+                cy + 12,
+                fill=accent,
+                outline="",
+            )
+        else:
+            self.canvas.create_oval(
+                cx + (box_w / 2.0) - 42,
+                cy - 12,
+                cx + (box_w / 2.0) - 18,
+                cy + 12,
+                fill="#152635",
+                outline="#28455c",
+            )
+
     def _draw_timeline(self, width: int, height: int, accent: str) -> None:
         chart_left = 40
         chart_right = width - 40

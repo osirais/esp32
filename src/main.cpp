@@ -12,7 +12,7 @@ namespace
   constexpr uint8_t kRegisterAccelXoutHigh = 0x3B;
 
   constexpr int SDA_PIN = 21;
-  constexpr int SCL_PIN = 23;
+  constexpr int SCL_PIN = 22;
 
 #ifdef LED_BUILTIN
   constexpr uint8_t kLedPin = LED_BUILTIN;
@@ -306,25 +306,25 @@ namespace
     switch (persistentAction)
     {
     case HandAction::RollPositive:
-      if (orientation.rollDeg > kRollExitDeg)
+      if (orientation.pitchDeg < -kPitchExitDeg)
       {
         return HandAction::RollPositive;
       }
       break;
     case HandAction::RollNegative:
-      if (orientation.rollDeg < -kRollExitDeg)
+      if (orientation.pitchDeg > kPitchExitDeg)
       {
         return HandAction::RollNegative;
       }
       break;
     case HandAction::PitchUp:
-      if (orientation.pitchDeg > kPitchExitDeg)
+      if (orientation.rollDeg < -kRollExitDeg)
       {
         return HandAction::PitchUp;
       }
       break;
     case HandAction::PitchDown:
-      if (orientation.pitchDeg < -kPitchExitDeg)
+      if (orientation.rollDeg > kRollExitDeg)
       {
         return HandAction::PitchDown;
       }
@@ -336,23 +336,23 @@ namespace
     if (orientation.rollDeg > kRollEnterDeg &&
         fabsf(orientation.rollDeg) >= fabsf(orientation.pitchDeg))
     {
-      return HandAction::RollPositive;
+      return HandAction::PitchDown;
     }
 
     if (orientation.rollDeg < -kRollEnterDeg &&
         fabsf(orientation.rollDeg) >= fabsf(orientation.pitchDeg))
     {
-      return HandAction::RollNegative;
+      return HandAction::PitchUp;
     }
 
     if (orientation.pitchDeg > kPitchEnterDeg)
     {
-      return HandAction::PitchUp;
+      return HandAction::RollNegative;
     }
 
     if (orientation.pitchDeg < -kPitchEnterDeg)
     {
-      return HandAction::PitchDown;
+      return HandAction::RollPositive;
     }
 
     return HandAction::Neutral;
