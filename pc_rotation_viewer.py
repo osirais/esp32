@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import math
 import os
 import queue
@@ -15,6 +16,30 @@ try:
     import serial
 except Exception:
     serial = None
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
+
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_tasks_python
+    from mediapipe.tasks.python import vision as mp_tasks_vision
+except Exception:
+    mp = None
+    mp_tasks_python = None
+    mp_tasks_vision = None
 
 try:
     import gi
@@ -44,6 +69,13 @@ TWIST_HOLD_MS = 350
 TWIST_MAX_ROLL_PITCH_DEG = 35.0
 NEUTRAL_RESET_ROLL_PITCH_DEG = 8.0
 NEUTRAL_RESET_HOLD_MS = 350
+CAMERA_CLICK_HOLD_SECONDS = 0.34
+CAMERA_CLICK_COOLDOWN_SECONDS = 0.95
+HAND_POSE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "yolo26_hand_pose_fp32.onnx")
+MEDIAPIPE_GESTURE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "gesture_recognizer.task")
+HAND_POSE_CONFIDENCE = 0.35
+HAND_KEYPOINT_CONFIDENCE = 0.15
+MEDIAPIPE_FIST_CONFIDENCE = 0.55
 HISTORY_LIMIT = 6
 SAMPLE_LIMIT = 150
 ACTION_ORDER = [
@@ -54,7 +86,18 @@ ACTION_ORDER = [
     "PITCH_DOWN",
     "TWIST_POSITIVE",
     "TWIST_NEGATIVE",
+    "FIST",
 ]
+ACTION_DISPLAY_NAMES = {
+    "NEUTRAL": "Neutral",
+    "ROLL_POSITIVE": "Roll Right",
+    "ROLL_NEGATIVE": "Roll Left",
+    "PITCH_UP": "Pitch Up",
+    "PITCH_DOWN": "Pitch Down",
+    "TWIST_POSITIVE": "Yaw Right",
+    "TWIST_NEGATIVE": "Yaw Left",
+    "FIST": "Fist",
+}
 COMPUTER_ACTION_OPTIONS = [
     "Do nothing",
     "Move mouse right",
@@ -165,6 +208,16 @@ ACTION_STYLES = {
         "computer_action": "Left click",
         "computer_detail": "The computer treats the twist burst as a primary click.",
     },
+    "FIST": {
+        "title": "Fist",
+        "accent": "#66efb4",
+        "canvas": "#08181b",
+        "panel": "#184247",
+        "gesture": "Fist detected",
+        "hint": "The camera gesture action is firing.",
+        "computer_action": "Left click",
+        "computer_detail": "The computer treats the camera fist gesture as a configurable action.",
+    },
 }
 
 AXIS_COLORS = {
@@ -241,6 +294,7 @@ DEFAULT_BINDINGS = {
     "PITCH_DOWN": "Move mouse down",
     "TWIST_POSITIVE": "Right click",
     "TWIST_NEGATIVE": "Left click",
+    "FIST": "Left click",
 }
 
 
@@ -456,17 +510,22 @@ class RotationWindow:
         show_raw: bool,
         demo_mode: bool,
         auto_close_seconds: float,
+        camera_index: int,
     ) -> None:
         self.serial_port = serial_port
         self.baud = baud
         self.show_raw = show_raw
         self.demo_mode = demo_mode
         self.auto_close_seconds = auto_close_seconds
+        self.camera_index = camera_index
 
         self.data_queue: queue.Queue[MotionPacket] = queue.Queue(maxsize=120)
         self.action_queue: queue.Queue[str] = queue.Queue(maxsize=80)
         self.status_queue: queue.Queue[tuple[bool, str]] = queue.Queue(maxsize=20)
+        self.camera_status_queue: queue.Queue[str] = queue.Queue(maxsize=20)
+        self.camera_frame_queue: queue.Queue[tuple[str, str, float]] = queue.Queue(maxsize=3)
         self.stop_event = threading.Event()
+        self.camera_stop_event = threading.Event()
         self.desktop_input = DesktopInput()
 
         self.start_monotonic = time.monotonic()
@@ -479,6 +538,23 @@ class RotationWindow:
         self.last_continuous_action_at = 0.0
         self.last_input_detail = "Disabled"
         self.input_test_until = 0.0
+        self.camera_enabled = False
+        self.camera_thread: threading.Thread | None = None
+        self.camera_detail = "Off"
+        self.camera_fist_visible = False
+        self.camera_hand_visible = False
+        self.camera_click_until = 0.0
+        self.camera_preview_data = ""
+        self.camera_preview_photo = None
+        self.camera_detection_label = "Off"
+        self.camera_detection_confidence = 0.0
+        self.hand_pose_session = None
+        self.hand_pose_input_name = ""
+        self.hand_pose_output_name = ""
+        self.hand_pose_model_error = ""
+        self.gesture_recognizer = None
+        self.gesture_model_error = ""
+        self.camera_gesture_name = ""
 
         self.roll_deg = 0.0
         self.pitch_deg = 0.0
@@ -538,6 +614,9 @@ class RotationWindow:
         self.led_var = tk.StringVar(value="Off")
         self.input_state_var = tk.StringVar(value="Disabled")
         self.input_detail_var = tk.StringVar(value=self.desktop_input.backend_name)
+        self.camera_state_var = tk.StringVar(value="Off")
+        self.camera_button_var = tk.StringVar(value="Enable Camera")
+        self.camera_detection_var = tk.StringVar(value="Off")
         self.enable_button_var = tk.StringVar(value="Enable")
         self.binding_vars = {
             action: tk.StringVar(value=DEFAULT_BINDINGS[action])
@@ -615,6 +694,21 @@ class RotationWindow:
         )
         test_button.pack(side="left", padx=(10, 0))
 
+        self.camera_button = tk.Button(
+            header_right,
+            textvariable=self.camera_button_var,
+            command=self._toggle_camera_enabled,
+            bg="#173041",
+            fg="#f4f8ff",
+            activebackground="#214158",
+            activeforeground="#ffffff",
+            bd=0,
+            padx=18,
+            pady=9,
+            font=("Avenir Next", 11, "bold"),
+        )
+        self.camera_button.pack(side="left", padx=(10, 0))
+
         tk.Label(
             header_right,
             textvariable=self.input_state_var,
@@ -655,15 +749,9 @@ class RotationWindow:
 
         axis_card, axis_body = self._card(left_col, None, "#0d1c29")
         axis_card.pack(fill="x")
-        self._axis_card(axis_body, "Up / Down", "pitch", self.pitch_var, 90.0)
-        self._axis_card(axis_body, "Left / Right", "roll", self.roll_var, 90.0)
-        self._axis_card(axis_body, "Turn", "yaw", self.yaw_var, 180.0)
-
-        metrics_card, metrics_body = self._card(left_col, "Signal", "#0d1c29")
-        metrics_card.pack(fill="x", pady=(12, 0))
-        self._metric_bar(metrics_body, "Motion", "energy", self.energy_var, "#ffae57")
-        self._metric_bar(metrics_body, "Stability", "stability", self.stability_var, "#66efb4")
-        self._metric_bar(metrics_body, "Confidence", "confidence", self.confidence_var, "#7ad4ff")
+        self._axis_card(axis_body, "Pitch", "pitch", self.pitch_var, 90.0)
+        self._axis_card(axis_body, "Roll", "roll", self.roll_var, 90.0)
+        self._axis_card(axis_body, "Yaw", "yaw", self.yaw_var, 180.0)
 
         status_card, status_body = self._card(left_col, "Status", "#0d1c29")
         status_card.pack(fill="x", pady=(12, 0))
@@ -673,6 +761,7 @@ class RotationWindow:
         self._status_line(status_body, "Uptime", self.uptime_var)
         self._status_line(status_body, "LED", self.led_var)
         self._status_line(status_body, "Input", self.input_detail_var)
+        self._status_line(status_body, "Camera", self.camera_state_var)
 
         self.visual_card, visual_body = self._card(center_col, None, "#0d1c29")
         self.visual_card.pack(fill="both", expand=True)
@@ -694,6 +783,23 @@ class RotationWindow:
         desktop_card.pack(fill="both", expand=True, pady=(12, 0))
         self.desktop_canvas = tk.Canvas(desktop_body, bg="#08131c", height=245, highlightthickness=0, bd=0)
         self.desktop_canvas.pack(fill="both", expand=True)
+
+        camera_card, camera_body = self._card(right_col, "Camera", "#0d1c29")
+        camera_card.pack(fill="x", pady=(12, 0))
+        self.camera_canvas = tk.Canvas(camera_body, bg="#08131c", height=176, highlightthickness=0, bd=0)
+        self.camera_canvas.pack(fill="x")
+        camera_indicator = tk.Frame(camera_body, bg="#10202f", padx=10, pady=8)
+        camera_indicator.pack(fill="x", pady=(8, 0))
+        self.camera_indicator_dot = tk.Canvas(camera_indicator, width=28, height=28, bg="#10202f", highlightthickness=0, bd=0)
+        self.camera_indicator_dot.pack(side="left")
+        tk.Label(
+            camera_indicator,
+            textvariable=self.camera_detection_var,
+            fg="#edf4ff",
+            bg="#10202f",
+            font=("Trebuchet MS", 10, "bold"),
+            justify="left",
+        ).pack(side="left", padx=(8, 0))
 
     def _scroll_column(self, parent: tk.Widget, width: int) -> tk.Frame:
         outer = tk.Frame(parent, bg="#07121b", width=width)
@@ -750,20 +856,22 @@ class RotationWindow:
         return frame, body
 
     def _mapping_row(self, parent: tk.Widget, action: str) -> None:
-        row = tk.Frame(parent, bg="#10202f", padx=12, pady=12)
-        row.pack(fill="x", pady=5)
+        row = tk.Frame(parent, bg="#10202f", padx=10, pady=8)
+        row.pack(fill="x", pady=4)
 
         label = tk.Label(
             row,
-            text=ACTION_STYLES[action]["title"],
+            text=ACTION_DISPLAY_NAMES[action],
             fg="#f4f8ff",
             bg="#10202f",
-            font=("Avenir Next", 12, "bold"),
+            width=11,
+            anchor="w",
+            font=("Avenir Next", 10, "bold"),
         )
-        label.pack(anchor="w")
+        label.pack(side="left")
 
         menu_wrap = tk.Frame(row, bg="#10202f")
-        menu_wrap.pack(fill="x", pady=(10, 0))
+        menu_wrap.pack(side="right", fill="x", expand=True, padx=(8, 0))
 
         option = tk.OptionMenu(menu_wrap, self.binding_vars[action], *COMPUTER_ACTION_OPTIONS)
         option.configure(
@@ -775,9 +883,9 @@ class RotationWindow:
             bd=0,
             indicatoron=0,
             anchor="w",
-            padx=12,
-            pady=8,
-            font=("Trebuchet MS", 10),
+            padx=8,
+            pady=6,
+            font=("Trebuchet MS", 9),
         )
         option["menu"].configure(
             bg="#173041",
@@ -787,7 +895,7 @@ class RotationWindow:
             bd=0,
             font=("Trebuchet MS", 10),
         )
-        option.pack(fill="x")
+        option.pack(side="right", fill="x", expand=True)
 
         self.mapping_rows[action] = {
             "row": row,
@@ -943,6 +1051,49 @@ class RotationWindow:
     def _toggle_input_enabled(self) -> None:
         self._set_input_enabled(not self.input_enabled)
 
+    def _toggle_camera_enabled(self) -> None:
+        if self.camera_enabled:
+            self._stop_camera()
+            return
+
+        if cv2 is None:
+            self.camera_detail = "Install OpenCV"
+            self.camera_state_var.set(self.camera_detail)
+            return
+        has_mediapipe = mp is not None and os.path.exists(MEDIAPIPE_GESTURE_MODEL_PATH)
+        has_yolo_fallback = ort is not None and np is not None and os.path.exists(HAND_POSE_MODEL_PATH)
+        if not has_mediapipe and not has_yolo_fallback:
+            self.camera_detail = "Missing gesture model"
+            self.camera_state_var.set(self.camera_detail)
+            return
+
+        self.camera_stop_event.clear()
+        self.camera_enabled = True
+        self.camera_button_var.set("Disable Camera")
+        self.camera_detail = "Starting"
+        self.camera_state_var.set(self.camera_detail)
+        self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        self.camera_thread.start()
+
+    def _stop_camera(self) -> None:
+        self.camera_enabled = False
+        self.camera_stop_event.set()
+        self.camera_button_var.set("Enable Camera")
+        self.camera_detail = "Off"
+        self.camera_fist_visible = False
+        self.camera_hand_visible = False
+        self.camera_gesture_name = ""
+        self.camera_preview_data = ""
+        self.camera_detection_label = "Off"
+        self.camera_detection_confidence = 0.0
+        self.camera_detection_var.set("Off")
+        self.camera_state_var.set(self.camera_detail)
+        while True:
+            try:
+                self.camera_frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _set_input_enabled(self, enabled: bool) -> None:
         if enabled and not self.desktop_input.available:
             self.input_enabled = False
@@ -968,6 +1119,384 @@ class RotationWindow:
             self.last_input_detail = "Test move sent"
         else:
             self.last_input_detail = self.desktop_input.last_error or "Test move failed"
+
+    def _camera_loop(self) -> None:
+        if cv2 is None:
+            self._queue_camera_status("Install OpenCV")
+            return
+        model_ready = self._load_mediapipe_gesture_model()
+        if not model_ready and not self._load_hand_pose_model():
+            self._queue_camera_status(self.hand_pose_model_error or "YOLO unavailable")
+            self.camera_enabled = False
+            return
+
+        capture, backend_name = self._open_camera_capture()
+        if capture is None:
+            self._queue_camera_status("No camera")
+            self.camera_enabled = False
+            return
+
+        if not capture.isOpened():
+            self._queue_camera_status("No camera")
+            self.camera_enabled = False
+            return
+
+        fist_started_at = 0.0
+        last_click_at = 0.0
+        last_status_at = 0.0
+        last_preview_at = 0.0
+        read_failures = 0
+        self._queue_camera_status("Gesture watching" if self.gesture_recognizer is not None else "YOLO watching")
+
+        try:
+            while not self.stop_event.is_set() and not self.camera_stop_event.is_set():
+                ok, frame = capture.read()
+                if not ok:
+                    read_failures += 1
+                    if read_failures >= 40:
+                        self._queue_camera_status("Camera stalled")
+                        read_failures = 0
+                    else:
+                        self._queue_camera_status("Camera warming")
+                    time.sleep(0.12)
+                    continue
+
+                read_failures = 0
+                fist_visible, confidence = self._detect_fist(frame)
+                now = time.monotonic()
+                self.camera_fist_visible = fist_visible
+                preview_label = "Fist" if fist_visible else ("Hand" if self.camera_hand_visible else "No hand")
+                if now - last_preview_at > 0.10:
+                    self._queue_camera_frame(frame, preview_label, confidence)
+                    last_preview_at = now
+
+                if fist_visible:
+                    if fist_started_at == 0.0:
+                        fist_started_at = now
+                    held_long_enough = (now - fist_started_at) >= CAMERA_CLICK_HOLD_SECONDS
+                    cooled_down = (now - last_click_at) >= CAMERA_CLICK_COOLDOWN_SECONDS
+                    if self.input_enabled and held_long_enough and cooled_down:
+                        if self._perform_fist_input():
+                            last_click_at = now
+                            self.click_flash_until = now + 0.32
+                            self._queue_camera_status("Fist click")
+                        else:
+                            self.last_input_detail = self.desktop_input.last_error or "Camera click failed"
+                            self._queue_camera_status("Click failed")
+                else:
+                    fist_started_at = 0.0
+
+                if now - last_status_at > 0.20:
+                    if fist_visible:
+                        self._queue_camera_status(f"Fist {int(confidence * 100):02d}%")
+                    elif self.camera_hand_visible:
+                        detail = self.camera_gesture_name or "Hand"
+                        self._queue_camera_status(f"{detail} {int(confidence * 100):02d}%")
+                    elif self.input_enabled:
+                        self._queue_camera_status("Gesture watching" if self.gesture_recognizer is not None else "YOLO watching")
+                    else:
+                        self._queue_camera_status("Gesture standby" if self.gesture_recognizer is not None else "YOLO standby")
+                    last_status_at = now
+
+                time.sleep(0.025)
+        finally:
+            capture.release()
+            if not self.stop_event.is_set() and self.camera_stop_event.is_set():
+                self._queue_camera_status("Off")
+
+    def _load_mediapipe_gesture_model(self) -> bool:
+        if self.gesture_recognizer is not None:
+            return True
+        if mp is None or mp_tasks_python is None or mp_tasks_vision is None:
+            self.gesture_model_error = "Install MediaPipe"
+            return False
+        if not os.path.exists(MEDIAPIPE_GESTURE_MODEL_PATH):
+            self.gesture_model_error = "Missing MediaPipe model"
+            return False
+
+        self._queue_camera_status("Loading Gesture")
+        try:
+            base_options = mp_tasks_python.BaseOptions(model_asset_path=MEDIAPIPE_GESTURE_MODEL_PATH)
+            options = mp_tasks_vision.GestureRecognizerOptions(
+                base_options=base_options,
+                running_mode=mp_tasks_vision.RunningMode.IMAGE,
+                num_hands=1,
+                min_hand_detection_confidence=0.45,
+                min_hand_presence_confidence=0.45,
+                min_tracking_confidence=0.45,
+            )
+            self.gesture_recognizer = mp_tasks_vision.GestureRecognizer.create_from_options(options)
+        except Exception as exc:
+            self.gesture_model_error = f"Gesture load failed: {exc}"
+            return False
+
+        self.gesture_model_error = ""
+        return True
+
+    def _load_hand_pose_model(self) -> bool:
+        if self.hand_pose_session is not None:
+            return True
+        if ort is None or np is None:
+            self.hand_pose_model_error = "Install ONNX"
+            return False
+        if not os.path.exists(HAND_POSE_MODEL_PATH):
+            self.hand_pose_model_error = "Missing YOLO model"
+            return False
+
+        self._queue_camera_status("Loading YOLO")
+        try:
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 2
+            options.inter_op_num_threads = 1
+            session = ort.InferenceSession(
+                HAND_POSE_MODEL_PATH,
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception as exc:
+            self.hand_pose_model_error = f"YOLO load failed: {exc}"
+            return False
+
+        self.hand_pose_session = session
+        self.hand_pose_input_name = session.get_inputs()[0].name
+        self.hand_pose_output_name = session.get_outputs()[0].name
+        self.hand_pose_model_error = ""
+        return True
+
+    def _open_camera_capture(self) -> tuple[object | None, str]:
+        if cv2 is None:
+            return None, ""
+
+        device = f"/dev/video{self.camera_index}"
+        pipelines = []
+        if os.path.exists(device):
+            pipelines.append(
+                (
+                    "GStreamer",
+                    (
+                        f"v4l2src device={device} ! "
+                        "video/x-raw,width=320,height=240,framerate=30/1 ! "
+                        "videoconvert ! video/x-raw,format=BGR ! "
+                        "appsink drop=true max-buffers=1 sync=false"
+                    ),
+                )
+            )
+        pipelines.append(
+            (
+                "GStreamer auto",
+                (
+                    "autovideosrc ! "
+                    "video/x-raw,width=320,height=240,framerate=30/1 ! "
+                    "videoconvert ! video/x-raw,format=BGR ! "
+                    "appsink drop=true max-buffers=1 sync=false"
+                ),
+            )
+        )
+
+        for backend_name, pipeline in pipelines:
+            capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if capture.isOpened():
+                return capture, backend_name
+            capture.release()
+
+        capture = cv2.VideoCapture(self.camera_index)
+        if capture.isOpened():
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            capture.set(cv2.CAP_PROP_FPS, 24)
+            return capture, "OpenCV"
+        capture.release()
+        return None, ""
+
+    def _detect_fist(self, frame: object) -> tuple[bool, float]:
+        if self.gesture_recognizer is not None:
+            return self._detect_fist_with_mediapipe(frame)
+
+        if cv2 is None or np is None or self.hand_pose_session is None:
+            return False, 0.0
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (640, 640), interpolation=cv2.INTER_LINEAR)
+        tensor = resized.astype(np.float32) / 255.0
+        tensor = np.transpose(tensor, (2, 0, 1))[np.newaxis, ...]
+
+        try:
+            output = self.hand_pose_session.run(
+                [self.hand_pose_output_name],
+                {self.hand_pose_input_name: tensor},
+            )[0]
+        except Exception as exc:
+            self.hand_pose_model_error = f"YOLO run failed: {exc}"
+            return False, 0.0
+
+        detections = output[0] if output.ndim == 3 else output
+        if detections.size == 0:
+            return False, 0.0
+
+        best = detections[int(np.argmax(detections[:, 4]))]
+        hand_confidence = float(best[4])
+        self.camera_hand_visible = hand_confidence >= HAND_POSE_CONFIDENCE
+        if hand_confidence < HAND_POSE_CONFIDENCE:
+            return False, hand_confidence
+
+        keypoints = best[6:].reshape(21, 3)
+        fist_visible, curl_confidence = self._classify_fist_from_keypoints(keypoints)
+        return fist_visible, clamp(min(hand_confidence, curl_confidence), 0.0, 1.0)
+
+    def _detect_fist_with_mediapipe(self, frame: object) -> tuple[bool, float]:
+        if cv2 is None or mp is None or self.gesture_recognizer is None:
+            return False, 0.0
+
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.gesture_recognizer.recognize(image)
+        except Exception as exc:
+            self.gesture_model_error = f"Gesture run failed: {exc}"
+            self.camera_hand_visible = False
+            self.camera_gesture_name = ""
+            return False, 0.0
+
+        if not result.gestures:
+            self.camera_hand_visible = False
+            self.camera_gesture_name = ""
+            return False, 0.0
+
+        category = result.gestures[0][0]
+        gesture_name = category.category_name or ""
+        confidence = float(category.score)
+        self.camera_hand_visible = True
+        self.camera_gesture_name = gesture_name.replace("_", " ")
+        return gesture_name == "Closed_Fist" and confidence >= MEDIAPIPE_FIST_CONFIDENCE, confidence
+
+    def _classify_fist_from_keypoints(self, keypoints: object) -> tuple[bool, float]:
+        if np is None:
+            return False, 0.0
+
+        wrist = keypoints[0, :2]
+        palm_points = keypoints[[0, 5, 9, 13, 17], :2]
+        palm_conf = keypoints[[0, 5, 9, 13, 17], 2]
+        if float(np.mean(palm_conf)) < HAND_KEYPOINT_CONFIDENCE:
+            return False, 0.0
+
+        palm_size = max(
+            float(np.linalg.norm(keypoints[9, :2] - wrist)),
+            float(np.linalg.norm(keypoints[5, :2] - keypoints[17, :2])),
+            1.0,
+        )
+
+        curled_count = 0
+        usable_count = 0
+        curl_scores = []
+        for mcp_idx, pip_idx, dip_idx, tip_idx in ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20)):
+            conf = keypoints[[mcp_idx, pip_idx, dip_idx, tip_idx], 2]
+            if float(np.mean(conf)) < HAND_KEYPOINT_CONFIDENCE:
+                continue
+
+            mcp = keypoints[mcp_idx, :2]
+            pip = keypoints[pip_idx, :2]
+            dip = keypoints[dip_idx, :2]
+            tip = keypoints[tip_idx, :2]
+
+            mcp_to_tip = float(np.linalg.norm(tip - mcp)) / palm_size
+            wrist_to_mcp = float(np.linalg.norm(mcp - wrist)) / palm_size
+            wrist_to_pip = float(np.linalg.norm(pip - wrist)) / palm_size
+            wrist_to_dip = float(np.linalg.norm(dip - wrist)) / palm_size
+            wrist_to_tip = float(np.linalg.norm(tip - wrist)) / palm_size
+
+            v1 = mcp - pip
+            v2 = tip - pip
+            denom = max(float(np.linalg.norm(v1) * np.linalg.norm(v2)), 1e-6)
+            pip_angle = math.degrees(math.acos(clamp(float(np.dot(v1, v2)) / denom, -1.0, 1.0)))
+
+            folded_in = wrist_to_tip < (wrist_to_dip + 0.03) or wrist_to_tip < (wrist_to_pip + 0.10)
+            short_finger = mcp_to_tip < 0.48
+            sharp_bend = pip_angle < 118.0
+            curled = (sharp_bend and folded_in) or (short_finger and wrist_to_tip < (wrist_to_mcp + 0.62))
+            usable_count += 1
+            if curled:
+                curled_count += 1
+            bend_score = clamp((145.0 - pip_angle) / 55.0, 0.0, 1.0)
+            fold_score = clamp((wrist_to_dip + 0.14 - wrist_to_tip) / 0.34, 0.0, 1.0)
+            short_score = clamp((0.62 - mcp_to_tip) / 0.28, 0.0, 1.0)
+            curl_scores.append(max(bend_score * 0.7 + fold_score * 0.3, short_score))
+
+        if usable_count < 3:
+            return False, 0.0
+
+        curl_ratio = curled_count / usable_count
+        curl_confidence = clamp((curl_ratio * 0.60) + (float(np.mean(curl_scores)) * 0.40), 0.0, 1.0)
+        return curled_count >= 4, curl_confidence
+
+    def _queue_camera_status(self, detail: str) -> None:
+        try:
+            self.camera_status_queue.put_nowait(detail)
+        except queue.Full:
+            pass
+
+    def _queue_camera_frame(self, frame: object, label: str, confidence: float) -> None:
+        if cv2 is None:
+            return
+
+        try:
+            preview = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".png", preview)
+            if not ok:
+                return
+            data = base64.b64encode(encoded).decode("ascii")
+        except Exception:
+            return
+
+        if self.camera_frame_queue.full():
+            try:
+                self.camera_frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        try:
+            self.camera_frame_queue.put_nowait((data, label, confidence))
+        except queue.Full:
+            pass
+
+    def _perform_fist_input(self) -> bool:
+        if not self.desktop_input.available:
+            self.last_input_detail = self.desktop_input.backend_name
+            return False
+
+        configured_action = self.binding_vars["FIST"].get()
+        if configured_action == "Do nothing":
+            self.last_input_detail = "Fist ignored"
+            return True
+
+        if configured_action in CONTINUOUS_ACTIONS:
+            distance = 130
+            dx = 0
+            dy = 0
+            if configured_action == "Move mouse right":
+                dx = distance
+            elif configured_action == "Move mouse left":
+                dx = -distance
+            elif configured_action == "Move mouse up":
+                dy = -distance
+            elif configured_action == "Move mouse down":
+                dy = distance
+
+            if self.desktop_input.move_relative(dx, dy):
+                self.last_input_detail = f"Fist: {configured_action}"
+                return True
+            self.last_input_detail = self.desktop_input.last_error or f"{configured_action} failed"
+            return False
+
+        if configured_action in DISCRETE_ACTIONS or configured_action in REPEATING_ACTIONS:
+            if self.desktop_input.perform(configured_action):
+                self.last_discrete_action_at = time.monotonic()
+                self.last_input_detail = f"Fist: {configured_action}"
+                return True
+            self.last_input_detail = self.desktop_input.last_error or f"{configured_action} failed"
+            return False
+
+        self.last_input_detail = f"Fist: {configured_action}"
+        return False
 
     def _update_input_controls(self) -> None:
         if self.input_enabled:
@@ -1131,12 +1660,14 @@ class RotationWindow:
 
     def _tick(self) -> None:
         self._drain_status_queue()
+        self._drain_camera_status_queue()
         self._drain_action_queue()
         self._drain_data_queue()
         self._sync_current_mapping()
         self._update_status_vars()
         self._update_axis_bars()
         self._update_metric_bars()
+        self._draw_camera_preview()
         self._draw_desktop_preview()
         self._draw_scene()
         if not self.stop_event.is_set():
@@ -1156,6 +1687,26 @@ class RotationWindow:
 
         if not changed:
             return
+
+    def _drain_camera_status_queue(self) -> None:
+        changed = False
+        while True:
+            try:
+                detail = self.camera_status_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            self.camera_detail = detail
+            changed = True
+
+        if not changed:
+            return
+
+        self.camera_state_var.set(self.camera_detail)
+        if self.camera_detail in {"No camera", "Install OpenCV", "Off"} and not self.camera_enabled:
+            self.camera_button_var.set("Enable Camera")
+        elif self.camera_enabled:
+            self.camera_button_var.set("Disable Camera")
 
     def _drain_action_queue(self) -> None:
         while True:
@@ -1385,7 +1936,7 @@ class RotationWindow:
         self._update_mapping_rows()
 
     def _update_mapping_rows(self) -> None:
-        active = self.action_name
+        active = "FIST" if self.camera_fist_visible else self.action_name
         for action, widgets in self.mapping_rows.items():
             is_active = action == active
             bg = mix_hex("#10202f", ACTION_STYLES[action]["panel"], 0.28 if is_active else 0.0)
@@ -1457,6 +2008,68 @@ class RotationWindow:
             fill_width = 4.0 + ((width - 8.0) * value / 100.0)
             canvas.create_rectangle(4, 5, fill_width, height - 5, fill=color, outline="")
             canvas.create_line(4, height - 4, width - 4, height - 4, fill="#173041")
+
+    def _draw_camera_preview(self) -> None:
+        canvas = self.camera_canvas
+        canvas.delete("all")
+        self.camera_indicator_dot.delete("all")
+        width = max(canvas.winfo_width(), 245)
+        height = max(canvas.winfo_height(), 176)
+
+        while True:
+            try:
+                data, label, confidence = self.camera_frame_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.camera_preview_data = data
+            self.camera_detection_label = label
+            self.camera_detection_confidence = confidence
+
+        canvas.create_rectangle(0, 0, width, height, fill="#08131c", outline="#183243")
+        if self.camera_preview_data:
+            try:
+                self.camera_preview_photo = tk.PhotoImage(data=self.camera_preview_data)
+                image_width = self.camera_preview_photo.width()
+                image_height = self.camera_preview_photo.height()
+                scale_x = width / max(1, image_width)
+                scale_y = height / max(1, image_height)
+                scale = min(scale_x, scale_y)
+                draw_width = image_width * scale
+                draw_height = image_height * scale
+                x = (width - draw_width) / 2.0
+                y = (height - draw_height) / 2.0
+                canvas.create_image(x, y, anchor="nw", image=self.camera_preview_photo)
+            except tk.TclError:
+                self.camera_preview_data = ""
+
+        if not self.camera_preview_data:
+            text = "Enable camera" if not self.camera_enabled else self.camera_detail
+            canvas.create_text(
+                width / 2.0,
+                height / 2.0,
+                text=text,
+                fill="#87a0b6",
+                font=("Trebuchet MS", 12, "bold"),
+            )
+            if self.camera_enabled:
+                self.camera_detection_label = "Waiting"
+                self.camera_detection_confidence = 0.0
+
+        if self.camera_detection_label == "Fist":
+            dot_color = "#66efb4"
+            label_text = f"Fist {int(self.camera_detection_confidence * 100):02d}%"
+        elif self.camera_detection_label == "Hand":
+            dot_color = "#7ad4ff"
+            label_text = f"Hand {int(self.camera_detection_confidence * 100):02d}%"
+        elif self.camera_enabled:
+            dot_color = "#7e94a9"
+            label_text = "No hand"
+        else:
+            dot_color = "#293b4c"
+            label_text = "Off"
+
+        self.camera_detection_var.set(label_text)
+        self.camera_indicator_dot.create_oval(4, 4, 24, 24, fill=dot_color, outline="")
 
     def _update_virtual_cursor(self, dt: float) -> None:
         if dt <= 0.0:
@@ -1563,8 +2176,6 @@ class RotationWindow:
             width_px = 3 if offset == 0 else 1
             self.canvas.create_line(x1, y1, x2, y2, fill=color, width=width_px)
 
-        self.canvas.create_oval(cx - 11, cy - 11, cx + 11, cy + 11, outline=accent, width=3)
-
     def _draw_cube(self, width: int, height: int, accent: str, canvas_bg: str) -> None:
         rotated = [self._rotate_vertex(x, y, z) for (x, y, z) in VERTICES]
         projected = [self._project(x, y, z, width, height) for (x, y, z) in rotated]
@@ -1642,25 +2253,6 @@ class RotationWindow:
             fill=mix_hex("#c8d7e8", accent, 0.55),
             font=("Trebuchet MS", 13, "bold"),
         )
-
-        if self.led_on:
-            self.canvas.create_oval(
-                cx + (box_w / 2.0) - 42,
-                cy - 12,
-                cx + (box_w / 2.0) - 18,
-                cy + 12,
-                fill=accent,
-                outline="",
-            )
-        else:
-            self.canvas.create_oval(
-                cx + (box_w / 2.0) - 42,
-                cy - 12,
-                cx + (box_w / 2.0) - 18,
-                cy + 12,
-                fill="#152635",
-                outline="#28455c",
-            )
 
     def _draw_timeline(self, width: int, height: int, accent: str) -> None:
         chart_left = 40
@@ -1766,6 +2358,14 @@ class RotationWindow:
         if self.stop_event.is_set():
             return
         self.stop_event.set()
+        self.camera_enabled = False
+        self.camera_stop_event.set()
+        if self.gesture_recognizer is not None:
+            try:
+                self.gesture_recognizer.close()
+            except Exception:
+                pass
+            self.gesture_recognizer = None
         self.root.destroy()
 
     def run(self) -> None:
@@ -1780,6 +2380,7 @@ def main() -> None:
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("--show-raw", action="store_true", help="Print raw serial lines to the terminal")
     parser.add_argument("--demo", action="store_true", help="Run the dashboard with simulated telemetry")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index for fist clicks (default: 0)")
     parser.add_argument(
         "--auto-close-seconds",
         type=float,
@@ -1802,6 +2403,7 @@ def main() -> None:
         show_raw=args.show_raw,
         demo_mode=demo_mode,
         auto_close_seconds=args.auto_close_seconds,
+        camera_index=args.camera_index,
     )
     app.run()
 
