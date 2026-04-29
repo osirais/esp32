@@ -267,43 +267,55 @@ class MotionPacket:
 class DesktopInput:
     def __init__(self) -> None:
         self.ydotool_path = shutil.which("ydotool")
-        self.using_ydotool = self.ydotool_path is not None
-        self.available = self.using_ydotool or (Atspi is not None and Gdk is not None)
+        self.can_use_atspi = Atspi is not None and Gdk is not None
+        self.using_ydotool = self._ydotool_ready()
+        self.available = self.using_ydotool or self.can_use_atspi
         self.last_error = ""
         if self.using_ydotool:
             self.status = "Ready"
             self.backend_name = "ydotool virtual input"
-        elif self.available:
+        elif self.can_use_atspi:
             self.status = "Ready"
             self.backend_name = "GNOME accessibility input"
         else:
             self.status = "Unavailable"
             self.backend_name = "No desktop input backend"
 
+    def _ydotool_ready(self) -> bool:
+        return self.ydotool_path is not None and os.path.exists("/tmp/.ydotool_socket")
+
     def _run_ydotool(self, *args: str) -> bool:
-        if not self.ydotool_path:
+        if not self._ydotool_ready():
+            self.using_ydotool = False
             return False
+        self.using_ydotool = True
         env = os.environ.copy()
-        if os.path.exists("/tmp/.ydotool_socket"):
-            env["YDOTOOL_SOCKET"] = "/tmp/.ydotool_socket"
+        env["YDOTOOL_SOCKET"] = "/tmp/.ydotool_socket"
         try:
-            subprocess.Popen(
+            result = subprocess.run(
                 [self.ydotool_path, *args],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=env,
-                start_new_session=True,
+                timeout=0.8,
+                check=False,
             )
         except Exception as exc:
             self.last_error = f"ydotool failed: {exc}"
+            return False
+        if result.returncode != 0:
+            self.last_error = "ydotool daemon is not responding"
             return False
         return True
 
     def move_relative(self, dx: int, dy: int) -> bool:
         if not self.available or (dx == 0 and dy == 0):
             return False
-        if self.using_ydotool:
-            return self._run_ydotool("mousemove", "--", str(dx), str(dy))
+        if self._ydotool_ready() and self._run_ydotool("mousemove", "--", str(dx), str(dy)):
+            return True
+        if not self.can_use_atspi:
+            self.last_error = "No desktop input backend"
+            return False
         try:
             moved = bool(Atspi.generate_mouse_event(dx, dy, "rel"))
         except Exception as exc:
@@ -316,7 +328,7 @@ class DesktopInput:
     def click(self, button: int = 1) -> bool:
         if not self.available:
             return False
-        if self.using_ydotool:
+        if self._ydotool_ready():
             button_map = {
                 1: "0xC0",
                 2: "0xC2",
@@ -324,7 +336,11 @@ class DesktopInput:
                 4: "0xC4",
                 5: "0xC5",
             }
-            return self._run_ydotool("click", button_map.get(button, "0xC0"))
+            if self._run_ydotool("click", button_map.get(button, "0xC0")):
+                return True
+        if not self.can_use_atspi:
+            self.last_error = "No desktop input backend"
+            return False
         try:
             clicked = bool(Atspi.generate_mouse_event(0, 0, f"b{button}c"))
         except Exception as exc:
@@ -350,7 +366,7 @@ class DesktopInput:
     def key_press(self, key_name: str) -> bool:
         if not self.available:
             return False
-        if self.using_ydotool:
+        if self._ydotool_ready():
             key_codes = {
                 "space": "57",
                 "Return": "28",
@@ -360,7 +376,11 @@ class DesktopInput:
             if key_code is None:
                 self.last_error = f"Unknown ydotool key: {key_name}"
                 return False
-            return self._run_ydotool("key", f"{key_code}:1", f"{key_code}:0")
+            if self._run_ydotool("key", f"{key_code}:1", f"{key_code}:0"):
+                return True
+        if not self.can_use_atspi:
+            self.last_error = "No desktop input backend"
+            return False
         keyval = Gdk.keyval_from_name(key_name)
         if keyval == 0:
             self.last_error = f"Unknown key: {key_name}"
@@ -377,8 +397,12 @@ class DesktopInput:
     def back(self) -> bool:
         if not self.available:
             return False
-        if self.using_ydotool:
-            return self._run_ydotool("key", "56:1", "105:1", "105:0", "56:0")
+        if self._ydotool_ready():
+            if self._run_ydotool("key", "56:1", "105:1", "105:0", "56:0"):
+                return True
+        if not self.can_use_atspi:
+            self.last_error = "No desktop input backend"
+            return False
         alt = Gdk.keyval_from_name("Alt_L")
         left = Gdk.keyval_from_name("Left")
         if alt == 0 or left == 0:
