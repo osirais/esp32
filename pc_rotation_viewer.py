@@ -243,49 +243,6 @@ EDGES = [
     (0, 4), (1, 5), (2, 6), (3, 7),
 ]
 
-DEMO_SCENES = [
-    (
-        "Calibration Sweep",
-        lambda t: (
-            12.0 * math.sin(t * 0.75),
-            10.0 * math.cos(t * 0.42),
-            18.0 * math.sin(t * 0.25),
-        ),
-    ),
-    (
-        "Banking Test",
-        lambda t: (
-            36.0 * math.sin(t * 1.1),
-            7.0 * math.cos(t * 0.55),
-            22.0 * math.sin(t * 0.22),
-        ),
-    ),
-    (
-        "Pitch Dive",
-        lambda t: (
-            10.0 * math.sin(t * 0.85),
-            34.0 * math.sin(t * 0.95),
-            24.0 * math.cos(t * 0.28),
-        ),
-    ),
-    (
-        "Twist Burst",
-        lambda t: (
-            6.0 * math.sin(t * 1.1),
-            7.0 * math.cos(t * 0.95),
-            98.0 * math.sin(t * 1.7),
-        ),
-    ),
-    (
-        "Combo Orbit",
-        lambda t: (
-            (24.0 * math.sin(t * 0.8)) + (12.0 * math.cos(t * 1.35)),
-            (18.0 * math.cos(t * 0.68)) - (10.0 * math.sin(t * 1.18)),
-            (58.0 * math.sin(t * 0.58)) + (26.0 * math.sin(t * 1.3)),
-        ),
-    ),
-]
-
 DEFAULT_BINDINGS = {
     "NEUTRAL": "Do nothing",
     "ROLL_POSITIVE": "Move mouse right",
@@ -508,14 +465,12 @@ class RotationWindow:
         serial_port: str,
         baud: int,
         show_raw: bool,
-        demo_mode: bool,
         auto_close_seconds: float,
         camera_index: int,
     ) -> None:
         self.serial_port = serial_port
         self.baud = baud
         self.show_raw = show_raw
-        self.demo_mode = demo_mode
         self.auto_close_seconds = auto_close_seconds
         self.camera_index = camera_index
 
@@ -571,9 +526,9 @@ class RotationWindow:
         self.neutral_pose_since_ms = 0
         self.yaw_gesture_anchor_deg = 0.0
 
-        self.connected = demo_mode
-        self.connection_detail = "Built-in demo is running" if demo_mode else f"Waiting for {serial_port}"
-        self.scene_name = "Autopilot sweep" if demo_mode else "Live serial telemetry"
+        self.connected = False
+        self.connection_detail = f"Waiting for {serial_port}"
+        self.scene_name = "Live serial telemetry"
         self.motion_energy = 0.0
         self.stability = 100.0
         self.confidence = 40.0
@@ -584,12 +539,6 @@ class RotationWindow:
         self.virtual_cursor_y = 0.5
         self.click_flash_until = 0.0
         self.clicked_tile = ""
-
-        self.demo_paused = False
-        self.demo_roll_bias = 0.0
-        self.demo_pitch_bias = 0.0
-        self.demo_yaw_bias = 0.0
-        self.demo_manual_until = 0.0
 
         self.samples: list[MotionPacket] = []
 
@@ -992,14 +941,6 @@ class RotationWindow:
 
     def _bind_keys(self) -> None:
         self.root.bind("<Escape>", lambda _event: self._set_input_enabled(False))
-        self.root.bind("<Left>", lambda _event: self._nudge_demo(roll=-10.0))
-        self.root.bind("<Right>", lambda _event: self._nudge_demo(roll=10.0))
-        self.root.bind("<Up>", lambda _event: self._nudge_demo(pitch=10.0))
-        self.root.bind("<Down>", lambda _event: self._nudge_demo(pitch=-10.0))
-        self.root.bind("a", lambda _event: self._nudge_demo(yaw=-16.0))
-        self.root.bind("d", lambda _event: self._nudge_demo(yaw=16.0))
-        self.root.bind("r", lambda _event: self._reset_demo_bias())
-        self.root.bind("<space>", lambda _event: self._toggle_demo_pause())
         self.root.bind_all("<MouseWheel>", self._handle_mousewheel)
         self.root.bind_all("<Button-4>", self._handle_mousewheel)
         self.root.bind_all("<Button-5>", self._handle_mousewheel)
@@ -1026,27 +967,6 @@ class RotationWindow:
             except AttributeError:
                 return False
         return False
-
-    def _nudge_demo(self, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0) -> None:
-        if not self.demo_mode:
-            return
-
-        self.demo_roll_bias = clamp(self.demo_roll_bias + roll, -48.0, 48.0)
-        self.demo_pitch_bias = clamp(self.demo_pitch_bias + pitch, -42.0, 42.0)
-        self.demo_yaw_bias = clamp(self.demo_yaw_bias + yaw, -90.0, 90.0)
-        self.demo_manual_until = time.monotonic() + 2.8
-
-    def _reset_demo_bias(self) -> None:
-        self.demo_roll_bias = 0.0
-        self.demo_pitch_bias = 0.0
-        self.demo_yaw_bias = 0.0
-        self.demo_manual_until = 0.0
-
-    def _toggle_demo_pause(self) -> None:
-        if not self.demo_mode:
-            return
-
-        self.demo_paused = not self.demo_paused
 
     def _toggle_input_enabled(self) -> None:
         self._set_input_enabled(not self.input_enabled)
@@ -1509,70 +1429,7 @@ class RotationWindow:
             self.enable_button.configure(bg="#66efb4", activebackground="#7dffc5", fg="#07121b")
 
     def _data_source_loop(self) -> None:
-        if self.demo_mode:
-            self._demo_generator()
-            return
-
         self._serial_reader()
-
-    def _demo_generator(self) -> None:
-        scene_duration = 7.5
-        blend_window = 1.25
-        start = time.perf_counter()
-
-        while not self.stop_event.is_set():
-            now = time.perf_counter()
-            t = now - start
-
-            if self.demo_paused:
-                base_roll = self.roll_deg
-                base_pitch = self.pitch_deg
-                base_yaw = self.yaw_deg
-                scene_name = "Manual Hold"
-            else:
-                index = int(t / scene_duration) % len(DEMO_SCENES)
-                local_t = t % scene_duration
-                scene_name, func = DEMO_SCENES[index]
-                base_roll, base_pitch, base_yaw = func(t)
-
-                if local_t > scene_duration - blend_window:
-                    next_name, next_func = DEMO_SCENES[(index + 1) % len(DEMO_SCENES)]
-                    blend = (local_t - (scene_duration - blend_window)) / blend_window
-                    next_roll, next_pitch, next_yaw = next_func(t)
-                    base_roll = (base_roll * (1.0 - blend)) + (next_roll * blend)
-                    base_pitch = (base_pitch * (1.0 - blend)) + (next_pitch * blend)
-                    base_yaw = (base_yaw * (1.0 - blend)) + (next_yaw * blend)
-                    scene_name = f"{scene_name} -> {next_name}"
-
-            manual_blend = clamp((self.demo_manual_until - time.monotonic()) / 2.8, 0.0, 1.0)
-            roll = clamp(base_roll + (self.demo_roll_bias * manual_blend), -75.0, 75.0)
-            pitch = clamp(base_pitch + (self.demo_pitch_bias * manual_blend), -75.0, 75.0)
-            yaw = wrap_angle_deg(base_yaw + (self.demo_yaw_bias * manual_blend))
-
-            if manual_blend <= 0.0:
-                self.demo_roll_bias *= 0.90
-                self.demo_pitch_bias *= 0.90
-                self.demo_yaw_bias *= 0.88
-                if abs(self.demo_roll_bias) < 0.2:
-                    self.demo_roll_bias = 0.0
-                if abs(self.demo_pitch_bias) < 0.2:
-                    self.demo_pitch_bias = 0.0
-                if abs(self.demo_yaw_bias) < 0.4:
-                    self.demo_yaw_bias = 0.0
-
-            packet = MotionPacket(
-                roll=roll,
-                pitch=pitch,
-                yaw=yaw,
-                scene=scene_name,
-                timestamp=time.monotonic(),
-            )
-            try:
-                self.data_queue.put_nowait(packet)
-            except queue.Full:
-                pass
-
-            time.sleep(1.0 / 30.0)
 
     def _serial_reader(self) -> None:
         if serial is None:
@@ -2379,7 +2236,6 @@ def main() -> None:
     parser.add_argument("--port", default="/dev/ttyUSB0", help="Serial port (default: /dev/ttyUSB0)")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("--show-raw", action="store_true", help="Print raw serial lines to the terminal")
-    parser.add_argument("--demo", action="store_true", help="Run the dashboard with simulated telemetry")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index for fist clicks (default: 0)")
     parser.add_argument(
         "--auto-close-seconds",
@@ -2389,19 +2245,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    demo_mode = args.demo
-    if not demo_mode and serial is None:
-        print("pyserial is not available. Starting the built-in demo instead.")
-        demo_mode = True
-    if not demo_mode and not os.path.exists(args.port):
-        print(f"Serial port {args.port} was not found. Starting the built-in demo instead.")
-        demo_mode = True
+    if serial is None:
+        print("pyserial is not available. Install pyserial to read ESP32 telemetry.")
+    elif not os.path.exists(args.port):
+        print(f"Serial port {args.port} was not found. Waiting for the live device.")
 
     app = RotationWindow(
         serial_port=args.port,
         baud=args.baud,
         show_raw=args.show_raw,
-        demo_mode=demo_mode,
         auto_close_seconds=args.auto_close_seconds,
         camera_index=args.camera_index,
     )

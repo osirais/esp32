@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cd "$PROJECT_DIR"
+
+if [[ $# -gt 0 && "$1" == --* ]]; then
+  exec python3 "$PROJECT_DIR/pc_rotation_viewer.py" "$@"
+fi
+
+PORT="${1:-/dev/ttyUSB0}"
+BAUD="${2:-115200}"
+exec python3 "$PROJECT_DIR/pc_rotation_viewer.py" --port "$PORT" --baud "$BAUD"
